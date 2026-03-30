@@ -18,7 +18,7 @@ let lastScan: ProjectScanResult | null = null;
 export async function scanProject(projectPath: string): Promise<ProjectScanResult> {
   const files = await collectFiles(projectPath);
   const entities: EntitySummary[] = [];
-  const fileImports = new Map<string, string[]>(); // relativePath → imported relative paths
+  const fileImports = new Map<string, ImportInfo[]>();
 
   for (const filePath of files) {
     const source = await fs.readFile(filePath, "utf8");
@@ -217,13 +217,24 @@ function extractEntities(sourceFile: ts.SourceFile, relativePath: string): Entit
 
 // ── Import / dependency edge extraction ─────────────────────
 
+interface ImportInfo {
+  /** Resolved relative path of the imported file */
+  resolvedPath: string;
+  /** Specific named imports: import { foo, bar } from '...' */
+  namedImports: string[];
+  /** Has a default import: import Foo from '...' */
+  hasDefault: boolean;
+  /** Has namespace import: import * as Foo from '...' */
+  hasNamespace: boolean;
+}
+
 function extractImports(
   sourceFile: ts.SourceFile,
   relativePath: string,
   projectPath: string,
   allFiles: string[]
-): string[] {
-  const imports: string[] = [];
+): ImportInfo[] {
+  const imports: ImportInfo[] = [];
 
   for (const stmt of sourceFile.statements) {
     if (!ts.isImportDeclaration(stmt)) continue;
@@ -232,13 +243,38 @@ function extractImports(
     if (!ts.isStringLiteral(specifier)) continue;
 
     const raw = specifier.text;
-    if (!raw.startsWith(".")) continue; // skip bare module specifiers (node_modules)
+    if (!raw.startsWith(".")) continue;
 
     const dir = path.dirname(path.join(projectPath, relativePath));
     const resolved = resolveLocalImport(dir, raw, projectPath, allFiles);
-    if (resolved) {
-      imports.push(resolved);
+    if (!resolved) continue;
+
+    const namedImports: string[] = [];
+    let hasDefault = false;
+    let hasNamespace = false;
+
+    const importClause = stmt.importClause;
+    if (importClause) {
+      // import Foo from '...'
+      if (importClause.name) hasDefault = true;
+
+      const bindings = importClause.namedBindings;
+      if (bindings) {
+        if (ts.isNamedImports(bindings)) {
+          // import { foo, bar } from '...'
+          for (const el of bindings.elements) {
+            // Use the original name (propertyName) if aliased, otherwise the name
+            const originalName = el.propertyName ? el.propertyName.text : el.name.text;
+            namedImports.push(originalName);
+          }
+        } else if (ts.isNamespaceImport(bindings)) {
+          // import * as X from '...'
+          hasNamespace = true;
+        }
+      }
     }
+
+    imports.push({ resolvedPath: resolved, namedImports, hasDefault, hasNamespace });
   }
 
   return imports;
@@ -268,36 +304,67 @@ function resolveLocalImport(
 
 function buildEdges(
   entities: EntitySummary[],
-  fileImports: Map<string, string[]>
+  fileImports: Map<string, ImportInfo[]>
 ): GraphEdge[] {
   const edges: GraphEdge[] = [];
   const seen = new Set<string>();
 
-  // Import-based edges
-  for (const [fromFile, importedFiles] of fileImports) {
-    const fromEntities = entities.filter((e) => e.filePath === fromFile);
-    for (const toFile of importedFiles) {
-      const toEntities = entities.filter((e) => e.filePath === toFile);
+  function addEdge(fromId: string, toId: string, type: GraphEdge["type"]): void {
+    const key = `${fromId}→${toId}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    edges.push({ from: fromId, to: toId, type });
+    const fromEntity = entities.find((e) => e.id === fromId);
+    if (fromEntity) fromEntity.dependencies.push(toId);
+  }
 
-      for (const from of fromEntities) {
-        for (const to of toEntities) {
-          const key = `${from.id}→${to.id}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            edges.push({ from: from.id, to: to.id, type: "imports" });
-            from.dependencies.push(to.id);
+  // Import-based edges: only connect to specifically imported entities
+  for (const [fromFile, importList] of fileImports) {
+    // Find top-level entities in the importing file (components, functions, etc.)
+    // — not child entities like state/ui-element
+    const CHILD_KINDS = new Set(["ui-element", "state", "ref", "effect", "memo"]);
+    const fromEntities = entities.filter((e) => e.filePath === fromFile && !CHILD_KINDS.has(e.kind));
+
+    for (const imp of importList) {
+      const toFile = imp.resolvedPath;
+      const toEntities = entities.filter((e) => e.filePath === toFile && !CHILD_KINDS.has(e.kind));
+
+      if (imp.hasNamespace) {
+        // import * — connect to all top-level entities in target file
+        for (const from of fromEntities) {
+          for (const to of toEntities) {
+            addEdge(from.id, to.id, "imports");
+          }
+        }
+        continue;
+      }
+
+      // Find specifically imported entities by export name
+      const importedNames = new Set(imp.namedImports);
+      if (imp.hasDefault) importedNames.add("default");
+
+      const matchedTargets = toEntities.filter((e) => {
+        if (!e.exportName) return false;
+        return importedNames.has(e.exportName);
+      });
+
+      // If we matched specific targets, connect only to those
+      if (matchedTargets.length > 0) {
+        for (const from of fromEntities) {
+          for (const to of matchedTargets) {
+            addEdge(from.id, to.id, "imports");
           }
         }
       }
     }
   }
 
-  // Contains edges: component → ui-element (already in dependencies from extraction)
+  // Contains edges: component → children (ui-element, state, ref, effect, memo)
   for (const entity of entities) {
     if (entity.kind === "component") {
       for (const depId of entity.dependencies) {
         const dep = entities.find((e) => e.id === depId);
-        if (dep && dep.kind === "ui-element") {
+        if (dep && (dep.kind === "ui-element" || dep.kind === "state" || dep.kind === "ref" || dep.kind === "effect" || dep.kind === "memo")) {
           const key = `${entity.id}→${dep.id}`;
           if (!seen.has(key)) {
             seen.add(key);

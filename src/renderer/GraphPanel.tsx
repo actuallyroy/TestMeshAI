@@ -15,16 +15,26 @@ interface NodeLayout {
   filePath: string;
   x: number;
   y: number;
-  vx: number;
-  vy: number;
 }
 
-/* ── n8n-style node dimensions ── */
-const NODE_W = 172;
-const NODE_H = 60;
+/* ── Node card sizing ── */
+const NODE_W = 180;
+const NODE_H = 56;
+const CHILD_W = 150;
+const CHILD_H = 42;
 const PORT_R = 5;
-const HEADER_H = 22;
 const CORNER_R = 8;
+
+/* ── Layout spacing ── */
+const FILE_GAP_X = 100;       // horizontal gap between file groups
+const FILE_GAP_Y = 60;        // vertical gap between file group rows
+const CHILD_GAP_X = 16;       // horizontal gap between child nodes
+const CHILD_GAP_Y = 14;       // vertical gap between child rows
+const CHILD_OFFSET_Y = 24;    // vertical offset from parent to first child row
+const GROUP_PAD_X = 20;       // horizontal padding inside file group box
+const GROUP_PAD_TOP = 36;     // top padding for file group label
+const GROUP_PAD_BOTTOM = 20;
+const CHILDREN_PER_ROW = 3;   // child nodes per row under a parent
 
 const KIND_COLORS: Record<string, { accent: string; bg: string; icon: string }> = {
   function:       { accent: "#5b9df9", bg: "#1e2d4a", icon: "fn" },
@@ -42,6 +52,181 @@ const KIND_COLORS: Record<string, { accent: string; bg: string; icon: string }> 
 
 const DEFAULT_COLOR = { accent: "#5b9df9", bg: "#1e2d4a", icon: "?" };
 
+/* Children = entities that are nested under a parent component */
+const CHILD_KINDS = new Set(["ui-element", "state", "ref", "effect", "memo"]);
+
+/* ── Structured layout engine ── */
+
+interface FileGroup {
+  filePath: string;
+  /** Top-level entities in this file (components, functions, api-handlers, variables) */
+  parents: EntitySummary[];
+  /** Map from parent entity id → child entities */
+  childrenOf: Map<string, EntitySummary[]>;
+  /** Computed bounding box */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+function computeLayout(entities: EntitySummary[], edges: GraphEdge[]): NodeLayout[] {
+  // 1. Group entities by file
+  const fileMap = new Map<string, EntitySummary[]>();
+  for (const e of entities) {
+    const list = fileMap.get(e.filePath) ?? [];
+    list.push(e);
+    fileMap.set(e.filePath, list);
+  }
+
+  // 2. Build parent→child mapping from "contains" edges
+  const containsEdges = new Set<string>();
+  for (const edge of edges) {
+    if (edge.type === "contains") containsEdges.add(edge.to);
+  }
+
+  // Also use dependency lists from components
+  for (const e of entities) {
+    if (e.kind === "component") {
+      for (const depId of e.dependencies) {
+        const dep = entities.find((d) => d.id === depId);
+        if (dep && CHILD_KINDS.has(dep.kind)) containsEdges.add(depId);
+      }
+    }
+  }
+
+  // 3. Build file groups
+  const fileGroups: FileGroup[] = [];
+  for (const [filePath, fileEntities] of fileMap) {
+    const parents = fileEntities.filter((e) => !containsEdges.has(e.id));
+    const childrenOf = new Map<string, EntitySummary[]>();
+
+    // Assign children to their parent component
+    for (const parent of parents) {
+      if (parent.kind === "component") {
+        const kids = parent.dependencies
+          .map((depId) => fileEntities.find((e) => e.id === depId))
+          .filter((e): e is EntitySummary => !!e && CHILD_KINDS.has(e.kind));
+        if (kids.length > 0) childrenOf.set(parent.id, kids);
+      }
+    }
+
+    fileGroups.push({ filePath, parents, childrenOf, x: 0, y: 0, w: 0, h: 0 });
+  }
+
+  // 4. Compute size of each file group
+  for (const group of fileGroups) {
+    let maxBlockW = 0;
+    let totalH = 0;
+
+    for (const parent of group.parents) {
+      let blockW = NODE_W;
+      let blockH = NODE_H;
+
+      const children = group.childrenOf.get(parent.id);
+      if (children && children.length > 0) {
+        const rows = Math.ceil(children.length / CHILDREN_PER_ROW);
+        const colsInLastRow = children.length % CHILDREN_PER_ROW || CHILDREN_PER_ROW;
+        const maxCols = Math.min(children.length, CHILDREN_PER_ROW);
+        const childrenW = maxCols * CHILD_W + (maxCols - 1) * CHILD_GAP_X;
+        blockW = Math.max(blockW, childrenW);
+        blockH += CHILD_OFFSET_Y + rows * CHILD_H + (rows - 1) * CHILD_GAP_Y;
+      }
+
+      maxBlockW = Math.max(maxBlockW, blockW);
+      totalH += blockH + 20; // gap between parents
+    }
+
+    group.w = maxBlockW + GROUP_PAD_X * 2;
+    group.h = GROUP_PAD_TOP + totalH + GROUP_PAD_BOTTOM;
+  }
+
+  // 5. Arrange file groups in a grid (left to right, wrapping)
+  const MAX_ROW_W = 1800;
+  let curX = 60;
+  let curY = 60;
+  let rowH = 0;
+
+  for (const group of fileGroups) {
+    if (curX + group.w > MAX_ROW_W && curX > 60) {
+      curX = 60;
+      curY += rowH + FILE_GAP_Y;
+      rowH = 0;
+    }
+    group.x = curX;
+    group.y = curY;
+    curX += group.w + FILE_GAP_X;
+    rowH = Math.max(rowH, group.h);
+  }
+
+  // 6. Place nodes within their file groups
+  const nodes: NodeLayout[] = [];
+  const placed = new Set<string>();
+
+  for (const group of fileGroups) {
+    let py = group.y + GROUP_PAD_TOP;
+
+    for (const parent of group.parents) {
+      const parentX = group.x + group.w / 2;
+      const parentY = py + NODE_H / 2;
+
+      nodes.push({
+        id: parent.id,
+        label: parent.name,
+        kind: parent.kind,
+        filePath: parent.filePath,
+        x: parentX,
+        y: parentY,
+      });
+      placed.add(parent.id);
+
+      const children = group.childrenOf.get(parent.id);
+      if (children && children.length > 0) {
+        const rows = Math.ceil(children.length / CHILDREN_PER_ROW);
+        let childIdx = 0;
+
+        for (let row = 0; row < rows; row++) {
+          const colsThisRow = Math.min(CHILDREN_PER_ROW, children.length - childIdx);
+          const rowW = colsThisRow * CHILD_W + (colsThisRow - 1) * CHILD_GAP_X;
+          const rowStartX = parentX - rowW / 2 + CHILD_W / 2;
+          const rowY = parentY + NODE_H / 2 + CHILD_OFFSET_Y + row * (CHILD_H + CHILD_GAP_Y) + CHILD_H / 2;
+
+          for (let col = 0; col < colsThisRow; col++) {
+            const child = children[childIdx++];
+            nodes.push({
+              id: child.id,
+              label: child.name,
+              kind: child.kind,
+              filePath: child.filePath,
+              x: rowStartX + col * (CHILD_W + CHILD_GAP_X),
+              y: rowY,
+            });
+            placed.add(child.id);
+          }
+        }
+
+        py += NODE_H + CHILD_OFFSET_Y + rows * (CHILD_H + CHILD_GAP_Y) + 20;
+      } else {
+        py += NODE_H + 20;
+      }
+    }
+  }
+
+  // Place any orphaned entities that weren't placed
+  let orphanX = curX + 60;
+  let orphanY = 60;
+  for (const e of entities) {
+    if (!placed.has(e.id)) {
+      nodes.push({ id: e.id, label: e.name, kind: e.kind, filePath: e.filePath, x: orphanX, y: orphanY });
+      orphanY += NODE_H + 16;
+    }
+  }
+
+  return nodes;
+}
+
+/* ── Component ── */
+
 export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const nodesRef = useRef<NodeLayout[]>([]);
@@ -51,36 +236,41 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
   const offsetRef = useRef({ x: 0, y: 0 });
   const scaleRef = useRef(1);
   const [dimensions, setDimensions] = useState({ w: 800, h: 600 });
-  const tickCountRef = useRef(0);
 
-  // Sync nodes
+  // Compute layout when entities/edges change
   useEffect(() => {
-    const existing = new Map(nodesRef.current.map((n) => [n.id, n]));
-    const cols = Math.max(Math.ceil(Math.sqrt(entities.length)), 1);
+    const newNodes = computeLayout(entities, edges);
 
-    nodesRef.current = entities.map((e, i) => {
-      const prev = existing.get(e.id);
-      if (prev) {
-        prev.label = e.name;
-        prev.kind = e.kind;
-        prev.filePath = e.filePath;
-        return prev;
+    // Preserve positions of manually dragged nodes
+    const existing = new Map(nodesRef.current.map((n) => [n.id, n]));
+    for (const n of newNodes) {
+      const prev = existing.get(n.id);
+      if (prev && prev.x !== 0 && prev.y !== 0) {
+        // Only keep position if it was dragged (we mark this below)
       }
-      const col = i % cols;
-      const row = Math.floor(i / cols);
-      return {
-        id: e.id,
-        label: e.name,
-        kind: e.kind,
-        filePath: e.filePath,
-        x: 100 + col * 220 + (Math.random() - 0.5) * 40,
-        y: 100 + row * 120 + (Math.random() - 0.5) * 30,
-        vx: 0,
-        vy: 0,
-      };
-    });
-    tickCountRef.current = 0;
-  }, [entities]);
+    }
+
+    nodesRef.current = newNodes;
+
+    // Auto-fit: center the content
+    if (newNodes.length > 0) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const n of newNodes) {
+        minX = Math.min(minX, n.x - NODE_W);
+        minY = Math.min(minY, n.y - NODE_H);
+        maxX = Math.max(maxX, n.x + NODE_W);
+        maxY = Math.max(maxY, n.y + NODE_H);
+      }
+      const contentW = maxX - minX;
+      const contentH = maxY - minY;
+      const scaleX = (dimensions.w - 40) / contentW;
+      const scaleY = (dimensions.h - 40) / contentH;
+      const scale = Math.min(1, Math.min(scaleX, scaleY));
+      scaleRef.current = scale;
+      offsetRef.current.x = (dimensions.w - contentW * scale) / 2 - minX * scale;
+      offsetRef.current.y = (dimensions.h - contentH * scale) / 2 - minY * scale;
+    }
+  }, [entities, edges, dimensions]);
 
   // Resize
   useEffect(() => {
@@ -96,7 +286,7 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
     return () => ro.disconnect();
   }, []);
 
-  // Animation loop
+  // Render loop
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -112,128 +302,160 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
 
     let running = true;
     const nodeMap = new Map(nodesRef.current.map((n) => [n.id, n]));
-    let frameTime = performance.now();
 
-    function tick() {
+    function draw() {
       if (!running) return;
       const now = performance.now();
-      frameTime = now;
       const nodes = nodesRef.current;
       const scale = scaleRef.current;
       const ox = offsetRef.current.x;
       const oy = offsetRef.current.y;
 
-      // Physics (settle after ~300 ticks)
-      if (tickCountRef.current < 350) {
-        tickCountRef.current++;
-        const damping = tickCountRef.current > 250 ? 0.7 : 0.88;
-
-        // Repulsion
-        for (let i = 0; i < nodes.length; i++) {
-          for (let j = i + 1; j < nodes.length; j++) {
-            const a = nodes[i], b = nodes[j];
-            let dx = b.x - a.x;
-            let dy = b.y - a.y;
-            const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-            const force = 8000 / (dist * dist);
-            const fx = (dx / dist) * force;
-            const fy = (dy / dist) * force;
-            a.vx -= fx; a.vy -= fy;
-            b.vx += fx; b.vy += fy;
-          }
-        }
-
-        // Springs
-        for (const edge of edges) {
-          const a = nodeMap.get(edge.from), b = nodeMap.get(edge.to);
-          if (!a || !b) continue;
-          let dx = b.x - a.x, dy = b.y - a.y;
-          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-          const spring = (dist - 240) * 0.003;
-          const fx = (dx / dist) * spring, fy = (dy / dist) * spring;
-          a.vx += fx; a.vy += fy;
-          b.vx -= fx; b.vy -= fy;
-        }
-
-        // Gravity to center
-        const cx = dimensions.w / 2 / scale - ox / scale;
-        const cy = dimensions.h / 2 / scale - oy / scale;
-        for (const n of nodes) {
-          n.vx += (cx - n.x) * 0.0006;
-          n.vy += (cy - n.y) * 0.0006;
-        }
-
-        for (const n of nodes) {
-          if (dragRef.current?.nodeId === n.id) { n.vx = 0; n.vy = 0; continue; }
-          n.vx *= damping; n.vy *= damping;
-          n.x += n.vx; n.y += n.vy;
-        }
-      }
-
-      // ── Drawing ──
       ctx!.clearRect(0, 0, dimensions.w, dimensions.h);
       ctx!.save();
       ctx!.translate(ox, oy);
       ctx!.scale(scale, scale);
 
-      // Edges (smooth bezier)
+      // ── File group backgrounds ──
+      const fileGroups = new Map<string, { minX: number; minY: number; maxX: number; maxY: number }>();
+      for (const n of nodes) {
+        const isChild = CHILD_KINDS.has(n.kind);
+        const hw = isChild ? CHILD_W / 2 : NODE_W / 2;
+        const hh = isChild ? CHILD_H / 2 : NODE_H / 2;
+        const g = fileGroups.get(n.filePath);
+        if (g) {
+          g.minX = Math.min(g.minX, n.x - hw);
+          g.minY = Math.min(g.minY, n.y - hh);
+          g.maxX = Math.max(g.maxX, n.x + hw);
+          g.maxY = Math.max(g.maxY, n.y + hh);
+        } else {
+          fileGroups.set(n.filePath, { minX: n.x - hw, minY: n.y - hh, maxX: n.x + hw, maxY: n.y + hh });
+        }
+      }
+
+      for (const [filePath, bounds] of fileGroups) {
+        const pad = 24;
+        const x = bounds.minX - pad;
+        const y = bounds.minY - pad - 20;
+        const w = bounds.maxX - bounds.minX + pad * 2;
+        const h = bounds.maxY - bounds.minY + pad * 2 + 20;
+
+        ctx!.beginPath();
+        ctx!.roundRect(x, y, w, h, 12);
+        ctx!.fillStyle = "rgba(255,255,255,0.02)";
+        ctx!.fill();
+        ctx!.strokeStyle = "rgba(255,255,255,0.05)";
+        ctx!.lineWidth = 1;
+        ctx!.stroke();
+
+        // File label
+        ctx!.font = `500 10px 'JetBrains Mono', monospace`;
+        ctx!.fillStyle = "rgba(255,255,255,0.25)";
+        ctx!.textAlign = "left";
+        ctx!.textBaseline = "top";
+        const shortPath = filePath.length > 45 ? "..." + filePath.slice(-42) : filePath;
+        ctx!.fillText(shortPath, x + 10, y + 8);
+      }
+
+      // ── Edges ──
       for (const edge of edges) {
         const a = nodeMap.get(edge.from), b = nodeMap.get(edge.to);
         if (!a || !b) continue;
+
         const isHi = edge.from === selectedEntityId || edge.to === selectedEntityId;
         const colA = KIND_COLORS[a.kind] ?? DEFAULT_COLOR;
+        const isContains = edge.type === "contains";
 
-        const startX = a.x + NODE_W / 2;
-        const startY = a.y + NODE_H / 2;
-        const endX = b.x - NODE_W / 2;
-        const endY = b.y + NODE_H / 2;
-        const cpOffset = Math.abs(endX - startX) * 0.45 + 50;
+        const aW = CHILD_KINDS.has(a.kind) ? CHILD_W : NODE_W;
+        const bW = CHILD_KINDS.has(b.kind) ? CHILD_W : NODE_W;
+        const aH = CHILD_KINDS.has(a.kind) ? CHILD_H : NODE_H;
+        const bH = CHILD_KINDS.has(b.kind) ? CHILD_H : NODE_H;
 
-        ctx!.beginPath();
-        ctx!.moveTo(startX, startY);
-        ctx!.bezierCurveTo(startX + cpOffset, startY, endX - cpOffset, endY, endX, endY);
-        ctx!.strokeStyle = isHi ? colA.accent : "rgba(255,255,255,0.08)";
-        ctx!.lineWidth = isHi ? 2 : 1.5;
-        ctx!.stroke();
+        let startX: number, startY: number, endX: number, endY: number;
 
-        // Animated flow dots
-        if (isHi) {
-          const t = ((now / 1800) % 1);
-          for (let d = 0; d < 3; d++) {
-            const tt = (t + d * 0.33) % 1;
-            const px = bezierPoint(startX, startX + cpOffset, endX - cpOffset, endX, tt);
-            const py = bezierPoint(startY, startY, endY, endY, tt);
-            ctx!.beginPath();
-            ctx!.arc(px, py, 3, 0, Math.PI * 2);
-            ctx!.fillStyle = colA.accent;
-            ctx!.fill();
+        if (isContains) {
+          // Parent → child: draw from bottom center of parent to top center of child
+          startX = a.x;
+          startY = a.y + aH / 2;
+          endX = b.x;
+          endY = b.y - bH / 2;
+
+          ctx!.beginPath();
+          ctx!.moveTo(startX, startY);
+          const midY = (startY + endY) / 2;
+          ctx!.bezierCurveTo(startX, midY, endX, midY, endX, endY);
+          ctx!.strokeStyle = isHi ? colA.accent + "80" : "rgba(255,255,255,0.06)";
+          ctx!.lineWidth = isHi ? 1.5 : 1;
+          ctx!.setLineDash([4, 3]);
+          ctx!.stroke();
+          ctx!.setLineDash([]);
+        } else {
+          // Import edge: right side of A → left side of B
+          startX = a.x + aW / 2;
+          startY = a.y;
+          endX = b.x - bW / 2;
+          endY = b.y;
+
+          const cpOffset = Math.abs(endX - startX) * 0.4 + 60;
+
+          ctx!.beginPath();
+          ctx!.moveTo(startX, startY);
+          ctx!.bezierCurveTo(startX + cpOffset, startY, endX - cpOffset, endY, endX, endY);
+          ctx!.strokeStyle = isHi ? colA.accent : "rgba(255,255,255,0.08)";
+          ctx!.lineWidth = isHi ? 2 : 1.5;
+          ctx!.stroke();
+
+          // Animated flow dots on highlighted edges
+          if (isHi) {
+            const t = ((now / 2000) % 1);
+            for (let d = 0; d < 3; d++) {
+              const tt = (t + d * 0.33) % 1;
+              const px = bezierPoint(startX, startX + cpOffset, endX - cpOffset, endX, tt);
+              const py = bezierPoint(startY, startY, endY, endY, tt);
+              ctx!.beginPath();
+              ctx!.arc(px, py, 3, 0, Math.PI * 2);
+              ctx!.fillStyle = colA.accent;
+              ctx!.fill();
+            }
           }
-        }
 
-        // End port dot
-        ctx!.beginPath();
-        ctx!.arc(endX, endY, PORT_R, 0, Math.PI * 2);
-        ctx!.fillStyle = isHi ? colA.accent : "rgba(255,255,255,0.15)";
-        ctx!.fill();
+          // Port dots
+          ctx!.beginPath();
+          ctx!.arc(startX, startY, PORT_R, 0, Math.PI * 2);
+          ctx!.fillStyle = isHi ? colA.accent : "rgba(255,255,255,0.12)";
+          ctx!.fill();
+
+          ctx!.beginPath();
+          ctx!.arc(endX, endY, PORT_R, 0, Math.PI * 2);
+          ctx!.fillStyle = isHi ? colA.accent : "rgba(255,255,255,0.12)";
+          ctx!.fill();
+        }
       }
 
-      // Nodes (n8n-style rounded rect cards)
+      // ── Nodes ──
       for (const n of nodes) {
+        const isChild = CHILD_KINDS.has(n.kind);
+        const nw = isChild ? CHILD_W : NODE_W;
+        const nh = isChild ? CHILD_H : NODE_H;
         const isSelected = n.id === selectedEntityId;
         const col = KIND_COLORS[n.kind] ?? DEFAULT_COLOR;
 
-        // Shadow
+        const nx = n.x - nw / 2;
+        const ny = n.y - nh / 2;
+
+        // Shadow for selected
         if (isSelected) {
           ctx!.shadowColor = col.accent + "44";
-          ctx!.shadowBlur = 20;
-          ctx!.shadowOffsetY = 4;
+          ctx!.shadowBlur = 16;
+          ctx!.shadowOffsetY = 3;
         }
 
         // Card body
-        roundRect(ctx!, n.x - NODE_W / 2, n.y - NODE_H / 2, NODE_W, NODE_H, CORNER_R);
+        ctx!.beginPath();
+        ctx!.roundRect(nx, ny, nw, nh, CORNER_R);
         ctx!.fillStyle = col.bg;
         ctx!.fill();
-        ctx!.strokeStyle = isSelected ? col.accent : "rgba(255,255,255,0.1)";
+        ctx!.strokeStyle = isSelected ? col.accent : "rgba(255,255,255,0.08)";
         ctx!.lineWidth = isSelected ? 2 : 1;
         ctx!.stroke();
 
@@ -241,76 +463,71 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
         ctx!.shadowBlur = 0;
         ctx!.shadowOffsetY = 0;
 
-        // Header stripe
-        ctx!.save();
+        // Accent left stripe
         ctx!.beginPath();
-        ctx!.roundRect(n.x - NODE_W / 2, n.y - NODE_H / 2, NODE_W, HEADER_H, [CORNER_R, CORNER_R, 0, 0]);
-        ctx!.fillStyle = col.accent + "20";
-        ctx!.fill();
-        ctx!.restore();
-
-        // Icon square
-        const iconX = n.x - NODE_W / 2 + 10;
-        const iconY = n.y - NODE_H / 2 + (NODE_H - 28) / 2 + 3;
-        roundRect(ctx!, iconX, iconY, 28, 28, 5);
-        ctx!.fillStyle = col.accent + "22";
-        ctx!.fill();
-        ctx!.font = `600 10px 'DM Sans', sans-serif`;
+        ctx!.roundRect(nx, ny, 4, nh, [CORNER_R, 0, 0, CORNER_R]);
         ctx!.fillStyle = col.accent;
-        ctx!.textAlign = "center";
-        ctx!.textBaseline = "middle";
-        ctx!.fillText(col.icon.toUpperCase(), iconX + 14, iconY + 14);
-
-        // Label
-        ctx!.font = `500 12px 'DM Sans', sans-serif`;
-        ctx!.fillStyle = "#eeeef5";
-        ctx!.textAlign = "left";
-        ctx!.textBaseline = "middle";
-        const maxLabelW = NODE_W - 58;
-        const label = truncateText(ctx!, n.label, maxLabelW);
-        ctx!.fillText(label, iconX + 36, n.y - 3);
-
-        // Subtitle (file path)
-        ctx!.font = `400 9.5px 'JetBrains Mono', monospace`;
-        ctx!.fillStyle = "#6c6c8a";
-        const shortPath = n.filePath.length > 22 ? "..." + n.filePath.slice(-19) : n.filePath;
-        ctx!.fillText(shortPath, iconX + 36, n.y + 11);
-
-        // Connection ports (left & right)
-        // Left port
-        ctx!.beginPath();
-        ctx!.arc(n.x - NODE_W / 2, n.y + NODE_H / 2, PORT_R, 0, Math.PI * 2);
-        ctx!.fillStyle = col.bg;
         ctx!.fill();
-        ctx!.strokeStyle = isSelected ? col.accent : "rgba(255,255,255,0.2)";
-        ctx!.lineWidth = 1.5;
-        ctx!.stroke();
 
-        // Right port
-        ctx!.beginPath();
-        ctx!.arc(n.x + NODE_W / 2, n.y + NODE_H / 2, PORT_R, 0, Math.PI * 2);
-        ctx!.fillStyle = col.bg;
-        ctx!.fill();
-        ctx!.strokeStyle = isSelected ? col.accent : "rgba(255,255,255,0.2)";
-        ctx!.stroke();
+        if (isChild) {
+          // Compact child card
+          ctx!.font = `600 9px 'DM Sans', sans-serif`;
+          ctx!.fillStyle = col.accent;
+          ctx!.textAlign = "left";
+          ctx!.textBaseline = "middle";
+          ctx!.fillText(col.icon.toUpperCase(), nx + 12, n.y - 4);
+
+          ctx!.font = `500 10.5px 'DM Sans', sans-serif`;
+          ctx!.fillStyle = "#ddddf0";
+          const label = truncateText(ctx!, n.label, nw - 36);
+          ctx!.fillText(label, nx + 12, n.y + 9);
+        } else {
+          // Full-size parent card
+          // Icon square
+          const iconX = nx + 12;
+          const iconY = n.y - 12;
+          ctx!.beginPath();
+          ctx!.roundRect(iconX, iconY, 24, 24, 5);
+          ctx!.fillStyle = col.accent + "22";
+          ctx!.fill();
+          ctx!.font = `700 9px 'DM Sans', sans-serif`;
+          ctx!.fillStyle = col.accent;
+          ctx!.textAlign = "center";
+          ctx!.textBaseline = "middle";
+          ctx!.fillText(col.icon.toUpperCase(), iconX + 12, iconY + 12);
+
+          // Label
+          ctx!.font = `500 12px 'DM Sans', sans-serif`;
+          ctx!.fillStyle = "#eeeef5";
+          ctx!.textAlign = "left";
+          ctx!.textBaseline = "middle";
+          const maxLabelW = nw - 54;
+          const label = truncateText(ctx!, n.label, maxLabelW);
+          ctx!.fillText(label, iconX + 32, n.y - 5);
+
+          // File path subtitle
+          ctx!.font = `400 9px 'JetBrains Mono', monospace`;
+          ctx!.fillStyle = "#6c6c8a";
+          const shortPath = n.filePath.length > 20 ? "..." + n.filePath.slice(-17) : n.filePath;
+          ctx!.fillText(shortPath, iconX + 32, n.y + 10);
+        }
       }
 
       ctx!.restore();
-      animRef.current = requestAnimationFrame(tick);
+      animRef.current = requestAnimationFrame(draw);
     }
 
-    animRef.current = requestAnimationFrame(tick);
+    animRef.current = requestAnimationFrame(draw);
     return () => { running = false; cancelAnimationFrame(animRef.current); };
   }, [dimensions, edges, selectedEntityId]);
 
-  // Hit testing helper
+  // ── Interaction ──
+
   const screenToWorld = useCallback((clientX: number, clientY: number) => {
     const rect = canvasRef.current!.getBoundingClientRect();
-    const sx = clientX - rect.left;
-    const sy = clientY - rect.top;
     return {
-      x: (sx - offsetRef.current.x) / scaleRef.current,
-      y: (sy - offsetRef.current.y) / scaleRef.current,
+      x: (clientX - rect.left - offsetRef.current.x) / scaleRef.current,
+      y: (clientY - rect.top - offsetRef.current.y) / scaleRef.current,
     };
   }, []);
 
@@ -318,7 +535,10 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
     const nodes = nodesRef.current;
     for (let i = nodes.length - 1; i >= 0; i--) {
       const n = nodes[i];
-      if (wx >= n.x - NODE_W / 2 && wx <= n.x + NODE_W / 2 && wy >= n.y - NODE_H / 2 && wy <= n.y + NODE_H / 2) {
+      const isChild = CHILD_KINDS.has(n.kind);
+      const hw = (isChild ? CHILD_W : NODE_W) / 2;
+      const hh = (isChild ? CHILD_H : NODE_H) / 2;
+      if (wx >= n.x - hw && wx <= n.x + hw && wy >= n.y - hh && wy <= n.y + hh) {
         return n;
       }
     }
@@ -328,11 +548,9 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
   const handlePointerDown = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
     const { x, y } = screenToWorld(e.clientX, e.clientY);
     const node = hitTest(x, y);
-
     if (node) {
       dragRef.current = { nodeId: node.id, offsetX: x - node.x, offsetY: y - node.y };
       onSelectEntity(node.id);
-      tickCountRef.current = 0; // re-run physics briefly
     } else {
       panRef.current = {
         startX: e.clientX, startY: e.clientY,
@@ -368,8 +586,7 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
     const my = e.clientY - rect.top;
     const oldScale = scaleRef.current;
     const zoom = e.deltaY < 0 ? 1.08 : 1 / 1.08;
-    const newScale = Math.max(0.2, Math.min(3, oldScale * zoom));
-    // Zoom toward cursor
+    const newScale = Math.max(0.15, Math.min(3, oldScale * zoom));
     offsetRef.current.x = mx - (mx - offsetRef.current.x) * (newScale / oldScale);
     offsetRef.current.y = my - (my - offsetRef.current.y) * (newScale / oldScale);
     scaleRef.current = newScale;
@@ -410,11 +627,6 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
 
 /* ── Helpers ── */
 
-function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number | number[]) {
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, r);
-}
-
 function bezierPoint(p0: number, p1: number, p2: number, p3: number, t: number): number {
   const u = 1 - t;
   return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3;
@@ -423,8 +635,6 @@ function bezierPoint(p0: number, p1: number, p2: number, p3: number, t: number):
 function truncateText(ctx: CanvasRenderingContext2D, text: string, maxW: number): string {
   if (ctx.measureText(text).width <= maxW) return text;
   let t = text;
-  while (t.length > 1 && ctx.measureText(t + "...").width > maxW) {
-    t = t.slice(0, -1);
-  }
+  while (t.length > 1 && ctx.measureText(t + "...").width > maxW) t = t.slice(0, -1);
   return t + "...";
 }
