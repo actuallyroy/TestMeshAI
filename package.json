@@ -12,10 +12,14 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "chrome-remote-interface": "^0.34.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-test-renderer": "^19.2.4",
+    "tsx": "^4.21.0"
   },
   "devDependencies": {
+    "@types/chrome-remote-interface": "^0.33.0",
     "@types/electron": "^1.6.12",
     "@types/node": "^24.0.0",
     "@types/react": "^19.0.0",

@@ -38,7 +38,8 @@ const CHILDREN_PER_ROW = 3;   // child nodes per row under a parent
 
 const KIND_COLORS: Record<string, { accent: string; bg: string; icon: string }> = {
   function:       { accent: "#5b9df9", bg: "#1e2d4a", icon: "fn" },
-  "class-method": { accent: "#b07ce8", bg: "#2d1e4a", icon: "cls" },
+  "class":        { accent: "#c084fc", bg: "#2d1e4a", icon: "C" },
+  "class-method": { accent: "#b07ce8", bg: "#2d1e4a", icon: "m" },
   "api-handler":  { accent: "#3dd9a0", bg: "#1e3a2d", icon: "api" },
   module:         { accent: "#f0b449", bg: "#3a2d1e", icon: "mod" },
   component:      { accent: "#e06cf0", bg: "#3a1e3d", icon: "ui" },
@@ -53,7 +54,7 @@ const KIND_COLORS: Record<string, { accent: string; bg: string; icon: string }> 
 const DEFAULT_COLOR = { accent: "#5b9df9", bg: "#1e2d4a", icon: "?" };
 
 /* Children = entities that are nested under a parent component */
-const CHILD_KINDS = new Set(["ui-element", "state", "ref", "effect", "memo"]);
+const CHILD_KINDS = new Set(["ui-element", "state", "ref", "effect", "memo", "class-method"]);
 
 /* ── Structured layout engine ── */
 
@@ -103,7 +104,7 @@ function computeLayout(entities: EntitySummary[], edges: GraphEdge[]): NodeLayou
 
     // Assign children to their parent component
     for (const parent of parents) {
-      if (parent.kind === "component") {
+      if (parent.kind === "component" || parent.kind === "class") {
         const kids = parent.dependencies
           .map((depId) => fileEntities.find((e) => e.id === depId))
           .filter((e): e is EntitySummary => !!e && CHILD_KINDS.has(e.kind));
@@ -365,6 +366,8 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
         const isHi = edge.from === selectedEntityId || edge.to === selectedEntityId;
         const colA = KIND_COLORS[a.kind] ?? DEFAULT_COLOR;
         const isContains = edge.type === "contains";
+        const isTriggers = edge.type === "triggers";
+        const isCalls = edge.type === "calls";
 
         const aW = CHILD_KINDS.has(a.kind) ? CHILD_W : NODE_W;
         const bW = CHILD_KINDS.has(b.kind) ? CHILD_W : NODE_W;
@@ -373,8 +376,8 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
 
         let startX: number, startY: number, endX: number, endY: number;
 
-        if (isContains) {
-          // Parent → child: draw from bottom center of parent to top center of child
+        if ((isContains || isTriggers) && !isCalls) {
+          // Vertical: parent→child (contains) or element→state (triggers)
           startX = a.x;
           startY = a.y + aH / 2;
           endX = b.x;
@@ -384,13 +387,32 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
           ctx!.moveTo(startX, startY);
           const midY = (startY + endY) / 2;
           ctx!.bezierCurveTo(startX, midY, endX, midY, endX, endY);
-          ctx!.strokeStyle = isHi ? colA.accent + "80" : "rgba(255,255,255,0.06)";
-          ctx!.lineWidth = isHi ? 1.5 : 1;
-          ctx!.setLineDash([4, 3]);
+
+          if (isTriggers) {
+            ctx!.strokeStyle = isHi ? "#ff9f43" : "rgba(255,159,67,0.25)";
+            ctx!.lineWidth = isHi ? 2 : 1.5;
+            ctx!.setLineDash([6, 4]);
+          } else {
+            ctx!.strokeStyle = isHi ? colA.accent + "80" : "rgba(255,255,255,0.06)";
+            ctx!.lineWidth = isHi ? 1.5 : 1;
+            ctx!.setLineDash([4, 3]);
+          }
           ctx!.stroke();
           ctx!.setLineDash([]);
+
+          // Arrow tip for triggers
+          if (isTriggers && isHi) {
+            const angle = Math.atan2(endY - midY, endX - endX) || Math.PI / 2;
+            ctx!.beginPath();
+            ctx!.moveTo(endX, endY);
+            ctx!.lineTo(endX - 5, endY - 8);
+            ctx!.lineTo(endX + 5, endY - 8);
+            ctx!.closePath();
+            ctx!.fillStyle = "#ff9f43";
+            ctx!.fill();
+          }
         } else {
-          // Import edge: right side of A → left side of B
+          // Import/calls edge: right side of A → left side of B
           startX = a.x + aW / 2;
           startY = a.y;
           endX = b.x - bW / 2;
@@ -401,7 +423,11 @@ export function GraphPanel({ entities, edges, selectedEntityId, onSelectEntity }
           ctx!.beginPath();
           ctx!.moveTo(startX, startY);
           ctx!.bezierCurveTo(startX + cpOffset, startY, endX - cpOffset, endY, endX, endY);
-          ctx!.strokeStyle = isHi ? colA.accent : "rgba(255,255,255,0.08)";
+          if (isCalls) {
+            ctx!.strokeStyle = isHi ? "#5b9df9" : "rgba(91,157,249,0.15)";
+          } else {
+            ctx!.strokeStyle = isHi ? colA.accent : "rgba(255,255,255,0.08)";
+          }
           ctx!.lineWidth = isHi ? 2 : 1.5;
           ctx!.stroke();
 
